@@ -1,0 +1,12 @@
+.direnv
+.envrc
+shell.nix
+
+# Node
+node_modules/
+dist/
+.npm-global/
+*.tsbuildinfo
+
+# Watchtower runtime data (local cache, secrets-adjacent, machine-specific)
+.watchtower/

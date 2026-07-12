@@ -1,0 +1,26 @@
+{
+  "name": "watchtower",
+  "version": "0.0.0",
+  "description": "Build a digital clone of a developer's PR-review style from their past reviews",
+  "type": "module",
+  "bin": {
+    "watchtower": "./src/cli.ts"
+  },
+  "scripts": {
+    "dev": "tsx src/cli.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "start": "node dist/cli.js"
+  },
+  "dependencies": {
+    "@octokit/rest": "^21.0.2",
+    "commander": "^12.1.0",
+    "execa": "^9.5.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
