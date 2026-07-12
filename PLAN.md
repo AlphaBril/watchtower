@@ -129,12 +129,19 @@ Legend: [ ] todo · [~] in progress · [x] done
 - [x] Marker helper: `withReviewMarker` try/finally + `clearStaleMarker` on startup — `src/marker.ts`
 - [x] Verified: typecheck clean; `--help`, `setup`, `policies`, `learn`, missing-PAT error all work
 
-### Phase 1 — GitHub ingestion
-- [ ] Octokit client with PAT
-- [ ] Fetch PRs the target dev reviewed in the repo
-- [ ] Fetch PR meta + full diff → `cache/prs/<pr#>/`
-- [ ] Fetch dev's review comments with correct file/line/hunk anchoring → `truth/<pr#>/review_comments.json`
-- [ ] `learn` prints mined summary
+### Phase 1 — GitHub ingestion ✅ COMPLETE
+- [x] Octokit client with PAT (`src/github.ts`); zod file schemas (`src/schemas.ts`)
+- [x] Fetch PRs the target dev reviewed in the repo (`search reviewed-by:`)
+- [x] Fetch PR meta + full diff → `cache/prs/<pr#>/` (diff via `.diff` media type)
+- [x] Fetch dev's review comments with file/line/hunk anchoring → `truth/<pr#>/review_comments.json` (`src/ingest.ts`)
+- [x] `learn` prints mined summary; `review <pr#>` ingests one PR; idempotent w/ `--force`
+- [x] Verified live against a real private repo (getvirtualbrain/virtual-brain PR #3055 — 5 comments, anchoring correct)
+
+**Findings from live data (feed into later phases):**
+- `search.issuesAndPullRequests` REST endpoint is deprecated — migrate to GraphQL search before the App version.
+- Comments can have empty `diffHunk` and/or `line: null` (outdated/file-level comments) — matcher (Phase 3) must tolerate null line anchors.
+- Some review comments are meta/retraction ("my bad", "finalement on ne fera pas ça") — NOT policy signal. Confirms the need for nit/retraction filtering before/at learn.
+- Comments are in French — pi agents must be language-agnostic (they are; just noting).
 
 ### Phase 2 — pi agent wiring
 - [ ] Invoke `learn <pr#>`; verify it reads `truth/` + writes/merges `policies/*.md`
