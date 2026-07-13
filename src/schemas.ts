@@ -58,3 +58,29 @@ export const ReviewCommentsFileSchema = z.object({
 });
 
 export type ReviewCommentsFile = z.infer<typeof ReviewCommentsFileSchema>;
+
+// ── reviews/<pr#>/clone_comments.json (written by the review agent) ───────────
+
+export const CloneCommentSchema = z.object({
+  id: z.string(), // "clone:<n>"
+  path: z.string(),
+  line: z.number().int().nullable(),
+  startLine: z.number().int().nullable(),
+  side: CommentSide,
+  body: z.string(),
+  policyIds: z.array(z.string()),
+  confidence: z.number().min(0).max(1),
+});
+
+export type CloneComment = z.infer<typeof CloneCommentSchema>;
+
+export const CloneCommentsFileSchema = z.object({
+  schemaVersion: z.literal(1),
+  pr: z.number().int().positive(),
+  repo: z.string(),
+  generatedAt: z.string(),
+  policyVersion: z.string(),
+  comments: z.array(CloneCommentSchema),
+});
+
+export type CloneCommentsFile = z.infer<typeof CloneCommentsFileSchema>;

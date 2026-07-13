@@ -99,17 +99,17 @@ watchtower: fold deterministic + judge results → final precision/recall/FP sco
 **Invoking pi (confirmed):**
 
 ```
-pi -p -e .pi/extensions/isolation-guard.ts "/learn 10"
+pi -p -e .pi/extensions/isolation-guard.ts -e .pi/extensions/policy-format-guard.ts "/learn 10"
 ```
 
-- `-p` — non-interactive/print mode; the agent's result comes back on stdout (watchtower captures it).
-- `-e .pi/extensions/isolation-guard.ts` — load the isolation guard extension. **Pass this on EVERY call** (learn/review/judge), not just review — the guard is inert unless the `.watchtower/.review-active` marker is present, so it's safe on learn/judge and mandatory on review.
+- `-p` — non-interactive/print mode; the agent's result comes back on stdout (unused — results are read from files).
+- `-e <path>` — load an extension; `-e` may be repeated (settings.json is also auto-discovered, but we pass both guards explicitly so their handlers are guaranteed to load regardless of discovery). Both guards are safe on EVERY call: the isolation guard is inert unless the `.watchtower/.review-active` marker is present, and the policy-format guard only fires on writes to `policies/*.md`.
 - `"/learn 10"` — the slash-prompt (`.pi/prompts/<name>.md`) plus PR number as `$1`. Swap `/learn`→`/review`→`/judge`.
 
-So watchtower's three invocations are:
-- `pi -p -e .pi/extensions/isolation-guard.ts "/learn <pr#>"`
-- (touch marker) `pi -p -e .pi/extensions/isolation-guard.ts "/review <pr#>"` (rm marker)
-- `pi -p -e .pi/extensions/isolation-guard.ts "/judge <pr#>"`
+So watchtower's three invocations (both `-e` guards on each) are:
+- `pi -p -e …/isolation-guard.ts -e …/policy-format-guard.ts "/learn <pr#>"`
+- (touch marker) `… "/review <pr#>"` (rm marker)
+- `… "/judge <pr#>"`
 
 Agents fail cleanly when inputs are missing (verified: a bare `/learn 10` with no `.watchtower/` reports exactly which files are absent), so watchtower must guarantee cache/truth exist before invoking.
 
@@ -143,13 +143,19 @@ Legend: [ ] todo · [~] in progress · [x] done
 - Some review comments are meta/retraction ("my bad", "finalement on ne fera pas ça") — NOT policy signal. Confirms the need for nit/retraction filtering before/at learn.
 - Comments are in French — pi agents must be language-agnostic (they are; just noting).
 
-### Phase 2 — pi agent wiring
-- [ ] Invoke `learn <pr#>`; verify it reads `truth/` + writes/merges `policies/*.md`
-- [ ] Arm marker → invoke `review <pr#>` → disarm marker; verify it writes `reviews/<pr#>/clone_comments.json`
-- [ ] Verify isolation guard actually blocks `truth/` access during review (deliberately probe)
-- [ ] Parse the agents' JSON outputs against SCHEMAS.md; fail loudly on schema drift
+### Phase 2 — pi agent wiring ✅ COMPLETE
+- [x] Invoke `learn <pr#>`; verified reads `truth/` + writes `policies/*.md` (4 policies from PR #3055's 5 comments; retraction comments handled correctly)
+- [x] Arm marker → invoke `review <pr#>` → disarm marker; verified it writes `reviews/<pr#>/clone_comments.json` (2 comments, correct anchoring)
+- [x] Marker lifecycle verified: armed during review, disarmed via `finally` on success, and `clearStaleMarker()` on startup recovers from interrupted runs
+- [x] Parse agents' JSON outputs against zod schemas (`src/store.ts`); `CloneCommentsFileSchema` added — fails loud on drift
+- [x] **pi invocation fix:** `stdio: "inherit"` in `src/pi.ts` — execa's default piped stdin made pi block waiting for EOF (looked like a hang). Now pi behaves like a manual terminal run; stdout no longer captured (results read from files).
+- [ ] (optional) Directly observe the guard blocking a `truth/` read while armed — review agent stayed in-policy so never triggered it; probe pending.
+
+**Phase 2 result:** clone independently reproduced the dev's real `companyId`-in-OAuth-state concern from policies alone (no truth access) — strong signal for Phase 3 scoring.
 
 ### Phase 3 — Matching, scoring, loop (heart of POC)
+- [x] **Policy frontmatter (was deferred from Phase 2) — RESOLVED:** `.pi/agents/watchtower/learn.md` rewritten with a byte-exact `<policy_file_skeleton>`, forbidden-pattern list, and self-check. Backed by a new deterministic `.pi/extensions/policy-format-guard.ts` that blocks any malformed `write`/`edit` to `policies/*.md` with a field-specific diagnostic (registered in `.pi/settings.json`). All 4 policies now carry valid frontmatter (id/title/sourceComments[]/confidence/validationScore:null/version/createdFromPr). Phase 3 can index policies + write back `validationScore`.
+- [ ] Add zod schema + parser for policy frontmatter (watchtower read side) — mirror the guard's rules
 - [ ] Deterministic matcher (bucket by file+line region, keyword/overlap scoring)
 - [ ] Split results: confident matches vs. ambiguous pairs vs. unmatched (both sides)
 - [ ] Write `judge/pending/<pr#>/pairs.json`; invoke `judge <pr#>`; read `judge/results/<pr#>/judgments.json`
