@@ -1,6 +1,0 @@
-{
-  "extensions": [
-    ".pi/extensions/isolation-guard.ts",
-    ".pi/extensions/policy-format-guard.ts"
-  ]
-}

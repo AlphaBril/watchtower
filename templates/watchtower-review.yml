@@ -1,0 +1,78 @@
+# Copy to .github/workflows/watchtower-review.yml in the TARGET repo.
+#
+# Required:
+#   secrets.ANTHROPIC_API_KEY      — Claude API key for the Agent SDK
+#   vars.WATCHTOWER_DEV            — GitHub login of the developer being pre-reviewed for
+#   vars.WATCHTOWER_TOOL_REPO      — owner/repo of the watchtower CLI
+#   secrets.WATCHTOWER_TOOL_TOKEN  — read token for that repo (only if it is private)
+# Optional:
+#   vars.WATCHTOWER_RULES_PATH     — if you changed `rulesPath` in setup
+#
+# The rules must already be merged on the base branch at
+# .github/review-rules/<dev>-review/ (opened by `watchtower publish`). That folder
+# is outside .claude/ so teammates' Claude Code sessions never load it. Rules are
+# read from the BASE branch, so a PR cannot change the rules it is reviewed with.
+#
+# Fork PRs get no secrets on `pull_request`, so they are skipped.
+
+name: watchtower pre-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: watchtower-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pre-review:
+    if: >-
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != vars.WATCHTOWER_DEV
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out the PR head
+        uses: actions/checkout@v4
+        with:
+          path: repo
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0 # needs origin/<base> to read the rules
+
+      - name: Check out watchtower
+        uses: actions/checkout@v4
+        with:
+          path: tool
+          repository: ${{ vars.WATCHTOWER_TOOL_REPO }}
+          token: ${{ secrets.WATCHTOWER_TOOL_TOKEN || github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: tool/package-lock.json
+
+      - name: Install watchtower
+        working-directory: tool
+        run: npm ci
+
+      - name: Pre-review
+        working-directory: tool
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}
+          WATCHTOWER_DEV: ${{ vars.WATCHTOWER_DEV }}
+          WATCHTOWER_REPO: ${{ github.repository }}
+          WATCHTOWER_RULES_PATH: ${{ vars.WATCHTOWER_RULES_PATH }}
+        run: >-
+          npx tsx src/cli.ts review ${{ github.event.pull_request.number }}
+          --post
+          --repo-path ../repo
+          --in-place
+          --rules-ref origin/${{ github.event.pull_request.base.ref }}

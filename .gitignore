@@ -1,6 +1,7 @@
 .direnv
 .envrc
 shell.nix
+.env
 
 # Node
 node_modules/

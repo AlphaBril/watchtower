@@ -1,74 +1,93 @@
 import type { Command } from "commander";
-import { readConfig } from "../config.js";
-import { findReviewedPrs, makeOctokit } from "../github.js";
-import { ingestPr } from "../ingest.js";
-import { runPi } from "../pi.js";
-import { listPolicies, readTruth } from "../store.js";
+import { CostLog } from "../agent.js";
+import { readConfig, skillName } from "../config.js";
+import { writeJson } from "../fsutil.js";
+import { makeOctokit } from "../github.js";
+import { ingestPr, isTraining } from "../ingest.js";
+import { forgetPr, learnPr } from "../learn.js";
+import { stepLogger } from "../log.js";
+import { runStamp, watchtowerPaths } from "../paths.js";
+import { CandidatesSchema } from "../schemas.js";
+import { listCachedMetas, readMeta, readTruth, readValidatedOr } from "../store.js";
 
 export function registerLearn(program: Command): void {
   program
     .command("learn")
-    .description(
-      "Ingest the developer's reviewed PRs, then run the learn agent on each",
-    )
-    .option("--limit <n>", "max PRs to discover", (v) => parseInt(v, 10), 50)
-    .option("--force", "re-fetch even if cached", false)
-    .option("--no-agent", "ingest only; skip the learn agent")
-    .action(
-      async (opts: { limit: number; force: boolean; agent: boolean }) => {
-        const config = await readConfig();
-        const octokit = makeOctokit();
+    .description("Classify dev comments and learn rules from training PRs (+ harvested candidates)")
+    .argument("[prs...]", "specific PR numbers; omit for all cached training PRs and candidates")
+    .option("--forget", "drop these PRs from the ledger first so they are re-learned", false)
+    .option("--since <date>", "only training PRs first reviewed on/after this date")
+    .option("--recent <n>", "only the N most recent training PRs that have dev comments", (v) => parseInt(v, 10))
+    .action(async (prArgs: string[], opts: { forget: boolean; since?: string; recent?: number }) => {
+      const config = await readConfig();
+      const paths = watchtowerPaths();
+      const costs = new CostLog();
 
-        console.log(
-          `Discovering PRs reviewed by ${config.targetDev} in ${config.repo}...`,
-        );
-        const prs = await findReviewedPrs(
-          octokit,
-          config.repo,
-          config.targetDev,
-          opts.limit,
-        );
-        console.log(`Found ${prs.length} reviewed PR(s).`);
-
-        for (const [i, pr] of prs.entries()) {
-          console.log(`\n── PR #${pr} (${i + 1}/${prs.length}) ──`);
-
-          console.log(`  ingesting...`);
-          const res = await ingestPr(octokit, config.repo, pr, config.targetDev, {
-            force: opts.force,
-          });
-          const ingestStatus = res.skipped ? "cached" : `${res.commentCount} comment(s)`;
-          console.log(`  ingested: ${ingestStatus}`);
-
-          if (!opts.agent) {
-            console.log(`  (agent skipped)`);
-            continue;
-          }
-
-          // Guard: the learn agent has nothing to learn from a PR the dev left
-          // no review comments on. Read the truth file for the authoritative
-          // count (ingest returns 0 for cached PRs regardless of actual count).
-          const truth = await readTruth(pr);
-          if (truth.comments.length === 0) {
-            console.log(`  no review comments by ${config.targetDev} — skipping learn agent`);
-            continue;
-          }
-
-          console.log(`  running learn agent on PR #${pr} (${truth.comments.length} comment(s))...`);
-          const before = await listPolicies();
-          // pi inherits the terminal, so its output appears live.
-          await runPi("learn", pr);
-          const after = await listPolicies();
-          const added = after.filter((p) => !before.includes(p));
-          if (added.length > 0) {
-            console.log(`  + new policies: ${added.join(", ")}`);
+      let prs: number[];
+      if (prArgs.length > 0) {
+        prs = prArgs.map((p) => parseInt(p, 10));
+        for (const pr of prs) {
+          const meta = await readMeta(pr);
+          if (!isTraining(meta, config.trainUntil)) {
+            throw new Error(`PR #${pr} is in the held-out test set (reviewed after trainUntil); learning from it would leak into evaluate.`);
           }
         }
+      } else {
+        const metas = await listCachedMetas();
+        const candidates = await readValidatedOr(paths.candidates, CandidatesSchema, "candidates.json", { schemaVersion: 1, prs: [] });
+        if (candidates.prs.length > 0) {
+          // Harvested PRs: (re-)ingest so the dev's latest comments are in truth/.
+          const octokit = makeOctokit();
+          console.log(`Ingesting ${candidates.prs.length} harvested candidate PR(s)...`);
+          for (const pr of candidates.prs) {
+            await ingestPr(octokit, config.repo, pr, config.targetDev, { force: true });
+          }
+        }
+        // Only PRs with dev comments can teach anything; approvals are skipped.
+        const since = opts.since ? new Date(opts.since).toISOString() : "";
+        let training: number[] = [];
+        for (const m of metas) {
+          if (!isTraining(m, config.trainUntil) || (m.reviewedAt ?? m.createdAt) < since) continue;
+          if ((await readTruth(m.number)).comments.length > 0) training.push(m.number);
+        }
+        if (opts.recent !== undefined) training = training.slice(-opts.recent);
+        prs = [...new Set([...training, ...candidates.prs])];
+      }
+      if (prs.length === 0) {
+        console.log("Nothing to learn from — run `watchtower ingest` first.");
+        return;
+      }
 
-        const policies = await listPolicies();
-        console.log(
-          `\nDone. ${policies.length} polic${policies.length === 1 ? "y" : "ies"} on disk.`,
+      const created: string[] = [];
+      const updated = new Set<string>();
+      const costsPath = `${paths.runDir(runStamp())}/costs.json`;
+      const log = stepLogger();
+      for (const [i, pr] of prs.entries()) {
+        if (opts.forget) await forgetPr(pr);
+        const meta = await readMeta(pr);
+        console.log(`\n  [${i + 1}/${prs.length}] #${pr} ${meta.title.slice(0, 70)} (${meta.reviewedAt?.slice(0, 10) ?? "?"})`);
+        const res = await learnPr(pr, config, { costs, log });
+        // Saved after every PR so an interrupted run still records its spend.
+        await costs.write(costsPath);
+        if (!res) {
+          log("nothing new to learn");
+          continue;
+        }
+        created.push(...res.created);
+        res.updated.forEach((u) => updated.add(u));
+        log(
+          `${res.newComments} new comment(s) → +${res.created.length} rule(s), ~${res.updated.length} updated, ` +
+            `${res.skipped.length} skipped${res.rejected.length ? `, ${res.rejected.length} rejected` : ""} · run total $${costs.totalUsd}`,
         );
-      },
-    );
+        for (const s of res.skipped) log(`  skip ${s.commentId}: ${s.reason}`);
+        for (const r of res.rejected) log(`  reject ${r.id}: ${r.reason}`);
+      }
+
+      // Candidates are consumed once processed (the ledger remembers them).
+      await writeJson(paths.candidates, { schemaVersion: 1, prs: [] });
+      console.log(
+        `\nDone: ${created.length} new rule(s), ${updated.size} updated. Spend ≈ $${costs.totalUsd}. ` +
+          `Rules in ${paths.skillDir(skillName(config))} — see \`watchtower rules\`.`,
+      );
+    });
 }

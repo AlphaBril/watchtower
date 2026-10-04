@@ -1,47 +1,86 @@
 import type { Command } from "commander";
-import { readConfig } from "../config.js";
-import { makeOctokit } from "../github.js";
-import { ingestPr } from "../ingest.js";
-import { runPi } from "../pi.js";
-import { listPolicies, readCloneComments } from "../store.js";
+import { resolve } from "node:path";
+import { CostLog } from "../agent.js";
+import { readConfig, repoRulesPath, skillName } from "../config.js";
+import { writeJson } from "../fsutil.js";
+import { fetchPrDiff, fetchPull, makeOctokit, postReview, sameLogin } from "../github.js";
+import { stepLogger } from "../log.js";
+import { runStamp, watchtowerPaths } from "../paths.js";
+import { renderInline, renderReviewBody } from "../post.js";
+import { readRulesFromGit, reviewPr } from "../review.js";
+import { readRules } from "../rules.js";
 
 export function registerReview(program: Command): void {
   program
     .command("review")
-    .description("Ingest one PR and run the review agent to generate clone comments")
+    .description("Pre-review a PR at its head commit; print it, or post it as a non-blocking review")
     .argument("<pr>", "PR number", (v) => parseInt(v, 10))
-    .option("--force", "re-fetch even if cached", false)
-    .option("--no-agent", "ingest only; skip the review agent")
-    .action(async (pr: number, opts: { force: boolean; agent: boolean }) => {
-      const config = await readConfig();
-      const octokit = makeOctokit();
+    .option("--post", "post the review on GitHub (default: dry run)", false)
+    .option("--repo-path <path>", "checkout of the target repo (default: config localRepoPath)")
+    .option("--in-place", "use --repo-path directly when it is already at the PR head (CI)", false)
+    .option("--skill-dir <path>", "rules skill directory (default: the local .watchtower skill)")
+    .option("--rules-ref <ref>", "read rules from this git ref of the repo instead (e.g. origin/main)")
+    .option("--include-own", "also review PRs authored by the target developer", false)
+    .action(
+      async (
+        pr: number,
+        opts: { post: boolean; repoPath?: string; inPlace: boolean; skillDir?: string; rulesRef?: string; includeOwn: boolean },
+      ) => {
+        const config = await readConfig();
+        const octokit = makeOctokit();
+        const repoPath = opts.repoPath ? resolve(opts.repoPath) : config.localRepoPath;
+        if (!repoPath) throw new Error("No repo checkout: pass --repo-path or `watchtower setup --repo-path`.");
 
-      const res = await ingestPr(octokit, config.repo, pr, config.targetDev, {
-        force: opts.force,
-      });
-      console.log(
-        res.skipped
-          ? `PR #${pr}: already cached.`
-          : `PR #${pr}: ingested ${res.commentCount} review comment(s).`,
-      );
+        const pull = await fetchPull(octokit, config.repo, pr);
+        if (!opts.includeOwn && sameLogin(pull.user?.login, config.targetDev)) {
+          console.log(`PR #${pr} is authored by ${config.targetDev} — skipping (use --include-own).`);
+          return;
+        }
 
-      if (!opts.agent) return;
+        const name = skillName(config);
+        const rules = opts.rulesRef
+          ? await readRulesFromGit(repoPath, opts.rulesRef, repoRulesPath(config))
+          : await readRules(opts.skillDir ? resolve(opts.skillDir) : watchtowerPaths().skillDir(name));
+        if (rules.length === 0) {
+          console.log("No rules found — nothing to pre-review with.");
+          return;
+        }
 
-      const policies = await listPolicies();
-      if (policies.length === 0) {
-        console.log("No policies on disk yet — run `watchtower learn` first.");
-        return;
-      }
+        const costs = new CostLog();
+        const diff = await fetchPrDiff(octokit, config.repo, pr);
+        const review = await reviewPr(
+          {
+            pr,
+            repo: config.repo,
+            title: pull.title,
+            description: pull.body ?? "",
+            diff,
+            sha: pull.head.sha,
+            repoPath,
+            rules,
+            inPlace: opts.inPlace,
+          },
+          config,
+          { costs, log: stepLogger("  ") },
+        );
+        await writeJson(watchtowerPaths().review(pr), review);
 
-      // runPi auto-arms the .review-active marker so the isolation guard blocks
-      // the review agent from reading truth/ and runs/.
-      console.log(`Running review agent on PR #${pr}...`);
-      await runPi("review", pr);
+        const runId = runStamp();
+        const body = renderReviewBody(review, config.targetDev, runId);
+        const inline = renderInline(review, runId);
 
-      // Validate the agent's output against the shared schema; fail loud on drift.
-      const clone = await readCloneComments(pr);
-      console.log(
-        `Review agent produced ${clone.comments.length} comment(s) from ${policies.length} polic${policies.length === 1 ? "y" : "ies"}.`,
-      );
-    });
+        if (!opts.post) {
+          console.log(body);
+          for (const c of inline) console.log(`\n--- ${c.path}:${c.line}\n${c.body}`);
+          console.log(`\n(dry run — ${inline.length} inline comment(s); spend ≈ $${costs.totalUsd}; pass --post to publish)`);
+          return;
+        }
+        if (inline.length === 0 && review.summary.needsHumanJudgment.length === 0 && review.comments.length === 0) {
+          console.log(`Nothing to say on PR #${pr} — not posting. Spend ≈ $${costs.totalUsd}.`);
+          return;
+        }
+        const url = await postReview(octokit, config.repo, pr, review.sha, body, inline);
+        console.log(`Posted pre-review (${inline.length} inline): ${url} · spend ≈ $${costs.totalUsd}`);
+      },
+    );
 }

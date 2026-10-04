@@ -1,7 +1,7 @@
 {
   "name": "watchtower",
-  "version": "0.0.0",
-  "description": "Build a digital clone of a developer's PR-review style from their past reviews",
+  "version": "0.2.0",
+  "description": "A first-reviewer clone of a developer's PR-review concerns, learned from their past reviews",
   "type": "module",
   "bin": {
     "watchtower": "./src/cli.ts"
@@ -10,13 +10,15 @@
     "dev": "tsx src/cli.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
     "start": "node dist/cli.js"
   },
   "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.289",
     "@octokit/rest": "^21.0.2",
     "commander": "^12.1.0",
     "execa": "^9.5.1",
-    "zod": "^3.23.8"
+    "zod": "^4.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.1",

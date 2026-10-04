@@ -1,10 +1,14 @@
-# Watchtower — Plan & Progress Tracker
+# Watchtower — Plan & Progress Tracker (v2)
 
-> A CLI that builds a "digital clone" of a specific developer's **PR-review style**.
-> It mines the developer's past review comments, lets the `pi` agent turn them into
-> policies, then validates those policies by having `pi` re-review the same PRs with a
-> fresh context and checking whether it reproduces similar comments. Self-improves per
-> PR; flags low-confidence PRs for the real developer.
+> A **first reviewer** that works ahead of one developer. It learns the concerns that developer
+> reliably raises from their past reviews, pre-reviews new PRs so those concerns are raised
+> before the developer looks, and points them at the calls that need their judgment.
+> The developer stays the approver.
+
+**Success is measured by usefulness, not mimicry:**
+- **Caught first** — share of the developer's real concerns the clone raised (held-out replay).
+- **Inline usefulness** — share of inline clone comments that matched the developer or were valid on their own; in production, the developer's 👍/👎.
+- **Noise** — wrong/trivial comments per PR, and especially on PRs the developer passed clean.
 
 ---
 
@@ -12,177 +16,79 @@
 
 | Topic | Decision |
 |---|---|
-| Language/runtime | TypeScript / Node |
-| LLM backend | External `pi` coding agent, invoked over CLI (watchtower never calls a model API directly) |
-| pi interface | pi coding agent (`@earendil-works/pi-coding-agent`) configured under `.pi/`; **filesystem is the contract**; agents driven by PR number |
-| pi agents (exist) | `learn`, `review`, `judge` under `.pi/agents/watchtower/` + slash prompts `.pi/prompts/*.md` (arg `$1` = PR#); team in `.pi/agents/teams.yaml` |
-| No fake pi | Do not stub pi; drive the real agents |
-| GitHub auth (POC) | Personal Access Token |
-| Repo scope | One specific repo, chosen at setup |
-| POC learning path | Review-comment cloning first (authored-PR coding-style comes later) |
-| Match metric (POC) | **Deterministic first** (file+line bucketing + keyword overlap); escalate ambiguous/unmatched pairs to the `judge` agent (already built) |
-| Storage | Flat files — policies as `.md`, cache/scores as JSON |
-| Hiding real comments from `review` | **Enforced in code** — `.pi/extensions/isolation-guard.ts` blocks `read/grep/find/ls` into `truth/` + `runs/` while marker `.watchtower/.review-active` exists |
-| CLI tooling | `commander` (args) + `tsx` (dev, no build step); `execa` (pi subprocess); `zod` (validate pi JSON outputs) |
-| Secrets | PAT from `GITHUB_TOKEN` env var (never on disk); non-secret config in `.watchtower/config.json` |
+| Runtime | TypeScript CLI; agents run through the **Claude Agent SDK** (`@anthropic-ai/claude-agent-sdk`) |
+| Agent contract | Agents **never write files**: each returns `structured_output` (JSON Schema from zod); watchtower validates and writes |
+| Isolation | Review agent's cwd is a **git worktree at the reviewed commit** in a temp dir; tools `Read/Grep/Glob` only; PreToolUse hook denies paths outside it; `settingSources: []` |
+| Rules | Skill-shaped folder (`SKILL.md` index + `rules/<id>.md`, with `kind`, `severity`, `paths`, `status`). Published to the target repo at `.github/review-rules/<dev>-review/` (outside `.claude/`, so teammates' sessions never load it); the developer installs it as a **personal** skill with `watchtower skill install` |
+| Evaluation | Temporal **train/test split** (`trainUntil`); learn only from train, `evaluate` replays test; leak check against the ledger |
+| Replay fidelity | Diff at the **commit the developer reviewed** (`base…reviewedSha`), comment lines from `original_line` |
+| Comment hygiene | `classify` agent tags every dev comment (actionable/question/nit/retraction/reply/praise, severity, needs-outside-context) |
+| Delivery | GitHub Action in the target repo runs `watchtower review --post`; one non-blocking `COMMENT` review; rules read from the **base** branch |
+| Feedback | Developer 👍/👎 on inline comments → `harvest` → per-rule stats → `publish` promotes/retires via a rules PR the developer approves |
+| Secrets | `GITHUB_TOKEN` + `ANTHROPIC_API_KEY` from env, never on disk |
 
-## Division of labor
+## Commands
 
-| Concern | Owner |
+| Command | What it does |
 |---|---|
-| GitHub auth + fetch PRs/reviews/diffs | watchtower |
-| Write PR data into the cache + `truth/` | watchtower |
-| Toggle `.watchtower/.review-active` marker around review runs | watchtower |
-| `learn <pr#>` → read cached review + policies, write/update policy `.md` | pi agent |
-| `review <pr#>` → read cached PR + policies, write clone comments | pi agent |
-| Deterministic match clone ↔ real comments | watchtower |
-| Build `judge/pending/<pr#>/pairs.json` for ambiguous/unmatched pairs | watchtower |
-| `judge <pr#>` → semantic verdicts + recovered matches | pi agent |
-| Fold judgments into final score, decide loop/flag | watchtower |
+| `setup` | `--dev --repo --repo-path --train-until [--skill-name --rules-path --post-threshold --max-budget]` |
+| `ingest [prs…]` | Discover PRs the dev reviewed (incl. clean approvals); cache meta + diff at reviewed commit + all dev comments |
+| `learn [prs…]` | classify → learn on training PRs + harvested candidates; ledger prevents re-feeding |
+| `evaluate` | Held-out replay: review in sandbox → judge → `runs/<ts>/report.{md,json}` (the comfort report) |
+| `review <pr> [--post]` | Pre-review a live PR at head; dry-run prints, `--post` publishes. CI: `--in-place --rules-ref origin/<base>` |
+| `harvest` | 👍/👎 on watchtower comments → `stats/rules.json`; PRs where the dev commented after the pre-review → candidates |
+| `publish` | Apply promotions/retirements; open a PR updating `.github/review-rules/<dev>-review/` in the target repo; re-syncs the personal skill |
+| `skill install\|uninstall\|status` | Personal copy at `~/.claude/skills/<dev>-review/`, kept in sync by `learn`/`publish` |
+| `rules` | List rules with feedback stats |
 
-## Filesystem contract
-
-```
-.watchtower/
-  config.json                         # PAT ref, target dev, owner/repo, pi command, thresholds
-  .review-active                      # marker: present ONLY while `pi review` runs (blocks truth/ access)
-  cache/
-    prs/<pr#>/
-      meta.json                       # title, author, base/head SHA, changed files
-      diff.patch                      # full PR diff
-  truth/                              # REAL dev comments — review agent is NEVER pointed here
-    <pr#>/review_comments.json        # input to `learn`; input to watchtower scoring
-  policies/
-    <slug>.md                         # learn writes; review reads
-  reviews/
-    <pr#>/clone_comments.json         # review writes; watchtower reads to score
-  judge/
-    pending/<pr#>/pairs.json          # watchtower writes ambiguous/unmatched pairs
-    results/<pr#>/judgments.json      # judge writes semantic verdicts + recovered matches
-  runs/<timestamp>/report.json        # scores, mismatches, decision
-```
-
-Structural isolation (enforced by `.pi/extensions/isolation-guard.ts`): while the
-`.watchtower/.review-active` marker exists, the review agent's `read/grep/find/ls`
-into `truth/` and `runs/` is hard-blocked. Watchtower **must** create the marker
-before spawning `pi review` and remove it afterward (even on error).
-
-## Loop
+## Filesystem (`.watchtower/`, gitignored)
 
 ```
-watchtower: fetch PR N → cache/prs/N/{meta,diff} + truth/N/review_comments.json
-        │
-pi learn N        → writes/updates policies/*.md   (from truth/N)
-        │
-watchtower: touch .watchtower/.review-active        (arm isolation guard)
-pi review N       → writes reviews/N/clone_comments.json   (sees diff + policies ONLY)
-watchtower: rm .watchtower/.review-active            (disarm — always, even on error)
-        │
-watchtower: deterministic match clone_comments ↔ truth comments (file+line bucket + keyword)
-        │  ├─ confident matches → keep
-        │  └─ ambiguous pairs + unmatched (both sides) → judge/pending/N/pairs.json
-        │
-pi judge N        → judge/results/N/judgments.json   (semantic verdicts + recovered matches)
-        │
-watchtower: fold deterministic + judge results → final precision/recall/FP score
-        ├─ score high  ► validated, next PR
-        └─ score low   ► iterate; if stuck after N tries ► flag dev
+config.json                       # dev, repo, localRepoPath, trainUntil, models, thresholds
+cache/prs/<pr#>/meta.json         # incl. reviewedSha, reviewedAt, devReviewStates, diffSource
+cache/prs/<pr#>/diff.patch        # base…reviewedSha
+truth/<pr#>/review_comments.json  # dev comments (inline / review body / conversation)
+truth/<pr#>/classified.json       # classify output
+skill/<name>/SKILL.md             # generated index
+skill/<name>/rules/<id>.md        # rules (watchtower-written, validated)
+ledger.json                       # dev comment ids already learned from
+stats/rules.json                  # per posted comment: rules + dev reaction
+candidates.json                   # harvested PRs to learn from
+reviews/<pr#>/review.json         # last `review` output
+runs/<ts>/{report.md,report.json,costs.json,reviews/}
 ```
 
-## CLI surface (watchtower)
+## Gating (what gets posted inline)
 
-- `watchtower setup` — persist PAT, target dev, owner/repo, `pi` command/invocation, thresholds.
-- `watchtower learn` — ingest dev's reviewed PRs; per PR run learn → (marker) review (marker) → deterministic match → judge → score → loop/flag; print scorecard.
-- `watchtower review <pr#>` — ingest one PR, run the review agent, dry-run/post comments, flag if low confidence.
-- `watchtower policies` — list/diff the policy set.
+- confidence < 0.5 → dropped
+- not on a commentable HEAD line → review-body note
+- cites an `active` rule, or confidence ≥ `postThreshold` (0.85) → inline
+- otherwise → review-body note ("lower-confidence notes")
 
-**Invoking pi (confirmed):**
+Rule lifecycle: new rules start `probation`. ≥3 rated and ≥70% 👍 → `active`. ≥3 rated and <50% 👍 → `retired`. Changes only land through `publish`'s PR.
 
-```
-pi -p -e .pi/extensions/isolation-guard.ts -e .pi/extensions/policy-format-guard.ts "/learn 10"
-```
+## Phases
 
-- `-p` — non-interactive/print mode; the agent's result comes back on stdout (unused — results are read from files).
-- `-e <path>` — load an extension; `-e` may be repeated (settings.json is also auto-discovered, but we pass both guards explicitly so their handlers are guaranteed to load regardless of discovery). Both guards are safe on EVERY call: the isolation guard is inert unless the `.watchtower/.review-active` marker is present, and the policy-format guard only fires on writes to `policies/*.md`.
-- `"/learn 10"` — the slash-prompt (`.pi/prompts/<name>.md`) plus PR number as `$1`. Swap `/learn`→`/review`→`/judge`.
+- [x] 1. Runtime swap — Agent SDK wrapper with structured output, prompts ported, pi removed
+- [x] 2. Data correctness — reviewed-commit diff, classify, clean PRs, ledger, train/test split
+- [x] 3. Rules as a skill — new frontmatter, SKILL.md index, path-scoped selection
+- [x] 4. `evaluate` comfort report
+- [x] 5. `review --post` with gating + triage summary; Action template (`templates/watchtower-review.yml`)
+- [x] 6. `harvest` + `publish`
+- [ ] **Live validation** (needs real runs — see below)
+- [ ] Harvest state in CI (today `harvest`/`learn`/`publish` run locally, state lives in `.watchtower/`)
+- [ ] Migrate PR discovery from deprecated REST search to GraphQL
 
-So watchtower's three invocations (both `-e` guards on each) are:
-- `pi -p -e …/isolation-guard.ts -e …/policy-format-guard.ts "/learn <pr#>"`
-- (touch marker) `… "/review <pr#>"` (rm marker)
-- `… "/judge <pr#>"`
+### Live validation checklist
+1. `npm install && npm test`
+2. `watchtower setup --repo-path ~/Documents/virtual-brain --train-until <date ~2/3 through history>`
+3. `watchtower ingest --limit 60` → check train/test counts and that few PRs fall back to `FINAL diff`
+4. `watchtower learn` → read the rules in `.watchtower/skill/*/rules/` — would the dev sign off on them?
+5. `watchtower evaluate` → read `runs/<ts>/report.md`, spot-check the "valid but unmentioned" and "noise" samples
+6. `watchtower review <recent pr>` (dry run) → then pilot the Action on the target repo
 
-Agents fail cleanly when inputs are missing (verified: a bare `/learn 10` with no `.watchtower/` reports exactly which files are absent), so watchtower must guarantee cache/truth exist before invoking.
-
----
-
-## Phases & task status
-
-Legend: [ ] todo · [~] in progress · [x] done
-
-### Phase 0 — Scaffold ✅ COMPLETE
-- [x] TS/Node project init (package.json, tsconfig — ESM, strict; deps: commander, execa, zod, @octokit/rest)
-- [x] CLI framework wired (`setup`/`learn`/`review`/`policies` stubs) — `src/cli.ts` + `src/commands/*`
-- [x] Config module (zod-validated read/write `.watchtower/config.json`; PAT from `GITHUB_TOKEN`) — `src/config.ts`
-- [x] Folder-convention helper (paths for cache/truth/policies/reviews/judge/runs) — `src/paths.ts`
-- [x] Exact pi CLI invocation confirmed: `pi -p -e .pi/extensions/isolation-guard.ts "/<agent> <pr#>"`
-- [x] `pi` process runner (execa; review auto-wrapped in marker; surfaces non-zero exit) — `src/pi.ts`
-- [x] Marker helper: `withReviewMarker` try/finally + `clearStaleMarker` on startup — `src/marker.ts`
-- [x] Verified: typecheck clean; `--help`, `setup`, `policies`, `learn`, missing-PAT error all work
-
-### Phase 1 — GitHub ingestion ✅ COMPLETE
-- [x] Octokit client with PAT (`src/github.ts`); zod file schemas (`src/schemas.ts`)
-- [x] Fetch PRs the target dev reviewed in the repo (`search reviewed-by:`)
-- [x] Fetch PR meta + full diff → `cache/prs/<pr#>/` (diff via `.diff` media type)
-- [x] Fetch dev's review comments with file/line/hunk anchoring → `truth/<pr#>/review_comments.json` (`src/ingest.ts`)
-- [x] `learn` prints mined summary; `review <pr#>` ingests one PR; idempotent w/ `--force`
-- [x] Verified live against a real private repo (getvirtualbrain/virtual-brain PR #3055 — 5 comments, anchoring correct)
-
-**Findings from live data (feed into later phases):**
-- `search.issuesAndPullRequests` REST endpoint is deprecated — migrate to GraphQL search before the App version.
-- Comments can have empty `diffHunk` and/or `line: null` (outdated/file-level comments) — matcher (Phase 3) must tolerate null line anchors.
-- Some review comments are meta/retraction ("my bad", "finalement on ne fera pas ça") — NOT policy signal. Confirms the need for nit/retraction filtering before/at learn.
-- Comments are in French — pi agents must be language-agnostic (they are; just noting).
-
-### Phase 2 — pi agent wiring ✅ COMPLETE
-- [x] Invoke `learn <pr#>`; verified reads `truth/` + writes `policies/*.md` (4 policies from PR #3055's 5 comments; retraction comments handled correctly)
-- [x] Arm marker → invoke `review <pr#>` → disarm marker; verified it writes `reviews/<pr#>/clone_comments.json` (2 comments, correct anchoring)
-- [x] Marker lifecycle verified: armed during review, disarmed via `finally` on success, and `clearStaleMarker()` on startup recovers from interrupted runs
-- [x] Parse agents' JSON outputs against zod schemas (`src/store.ts`); `CloneCommentsFileSchema` added — fails loud on drift
-- [x] **pi invocation fix:** `stdio: "inherit"` in `src/pi.ts` — execa's default piped stdin made pi block waiting for EOF (looked like a hang). Now pi behaves like a manual terminal run; stdout no longer captured (results read from files).
-- [ ] (optional) Directly observe the guard blocking a `truth/` read while armed — review agent stayed in-policy so never triggered it; probe pending.
-
-**Phase 2 result:** clone independently reproduced the dev's real `companyId`-in-OAuth-state concern from policies alone (no truth access) — strong signal for Phase 3 scoring.
-
-### Phase 3 — Matching, scoring, loop (heart of POC)
-- [x] **Policy frontmatter (was deferred from Phase 2) — RESOLVED:** `.pi/agents/watchtower/learn.md` rewritten with a byte-exact `<policy_file_skeleton>`, forbidden-pattern list, and self-check. Backed by a new deterministic `.pi/extensions/policy-format-guard.ts` that blocks any malformed `write`/`edit` to `policies/*.md` with a field-specific diagnostic (registered in `.pi/settings.json`). All 4 policies now carry valid frontmatter (id/title/sourceComments[]/confidence/validationScore:null/version/createdFromPr). Phase 3 can index policies + write back `validationScore`.
-- [ ] Add zod schema + parser for policy frontmatter (watchtower read side) — mirror the guard's rules
-- [ ] Deterministic matcher (bucket by file+line region, keyword/overlap scoring)
-- [ ] Split results: confident matches vs. ambiguous pairs vs. unmatched (both sides)
-- [ ] Write `judge/pending/<pr#>/pairs.json`; invoke `judge <pr#>`; read `judge/results/<pr#>/judgments.json`
-- [ ] Fold deterministic + judge verdicts → precision/recall + false-positive rate
-- [ ] Per-PR scorecard + `runs/<ts>/report.json`
-- [ ] Refine-on-mismatch loop with iteration cap
-
-### Phase 4 — Flagging & self-improvement
-- [ ] Confidence thresholds → validated / iterate / flag
-- [ ] Flag-for-human mechanism (ping the dev)
-- [ ] Re-learn from a new human review
-
-### Phase 5 — Post-POC
-- [ ] Coding-style-from-authored-PRs (new pi agent + authored-PR ingestion)
-- [ ] Tune judge escalation policy (which pairs are "ambiguous" enough to send)
-- [ ] PAT → GitHub App + webhooks (autonomous pipeline)
-
----
-
-## Open questions / risks
-- Comment↔diff/line anchoring across a PR is fiddly (GitHub `diff_hunk` + position). Must be right in Phase 1.
-- **Marker leak:** if watchtower crashes mid-review and leaves `.review-active` behind, later non-review reads get blocked. Cleanup must be in a `finally`, and `setup`/startup should clear a stale marker.
-- Judge sees `truth/` + `reviews/` (needed for recovery) — fine because judge runs *after* review, with the marker down. Ordering matters: never run judge while the review marker is up.
-- "Nit vs. substantive" comment classification — the learn agent skips threaded replies, but may still need explicit nit-tagging so policies aren't polluted.
-- Overfitting: validating on the same PRs we learned from inflates scores. Add a held-out test set once enough data exists.
-
-## Schemas
-See [SCHEMAS.md](./SCHEMAS.md) for the file contracts. Note the pi agents already
-emit their own schemas — reconcile SCHEMAS.md against the agent prompts, and add the
-judge `pairs.json` / `judgments.json` shapes there.
+## Risks / open questions
+- "Valid but unmentioned" is LLM-judged — the report lists samples so the developer can confirm them.
+- Rules learned from a small history will cover few files; `review` says so ("outside the learned areas") rather than guessing.
+- Fork PRs get no secrets on `pull_request` and are skipped by the template.
+- Cost: classify (Haiku) is cheap; learn/judge (Opus) and review (Sonnet, with tool use) dominate — see `runs/<ts>/costs.json`.

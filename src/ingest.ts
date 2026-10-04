@@ -1,40 +1,39 @@
 import type { Octokit } from "@octokit/rest";
-import { access } from "node:fs/promises";
 import { watchtowerPaths } from "./paths.js";
 import { writeJson, writeText } from "./fsutil.js";
 import {
-  fetchDiff,
-  fetchMeta,
-  fetchReviewComments,
+  fetchCompareDiff,
+  fetchDevComments,
+  fetchDevReviews,
+  fetchFiles,
+  fetchPrDiff,
+  fetchPull,
 } from "./github.js";
 import {
   MetaSchema,
   ReviewCommentsFileSchema,
+  type Meta,
   type ReviewCommentsFile,
 } from "./schemas.js";
+import { readMeta, readTruth } from "./store.js";
 
 export interface IngestResult {
   pr: number;
+  meta: Meta;
   commentCount: number;
   skipped: boolean;
 }
 
-async function exists(path: string): Promise<boolean> {
-  try {
-    await access(path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 /**
- * Fetches a PR's meta, diff, and the target dev's review comments, and writes:
- *   cache/prs/<pr#>/meta.json
- *   cache/prs/<pr#>/diff.patch
- *   truth/<pr#>/review_comments.json
+ * Fetches a PR and the target dev's review activity, and writes:
+ *   cache/prs/<pr#>/meta.json   — incl. reviewedSha / reviewedAt / review states
+ *   cache/prs/<pr#>/diff.patch  — diff base…reviewedSha: the code the dev saw
+ *   truth/<pr#>/review_comments.json — inline + review-body + conversation comments
  *
- * Idempotent: if `force` is false and all three files exist, it skips fetching.
+ * Replaying the diff at the *reviewed* commit matters: the final PR diff often
+ * already contains the fix the dev asked for, so the clone couldn't raise it.
+ *
+ * Idempotent: skips when a v2 cache exists, unless `force`.
  */
 export async function ingestPr(
   octokit: Octokit,
@@ -46,38 +45,73 @@ export async function ingestPr(
   const paths = watchtowerPaths(opts.repoRoot);
 
   if (!opts.force) {
-    const cached = await Promise.all([
-      exists(paths.meta(pr)),
-      exists(paths.diff(pr)),
-      exists(paths.reviewComments(pr)),
-    ]);
-    if (cached.every(Boolean)) {
-      return { pr, commentCount: 0, skipped: true };
+    try {
+      const [meta, truth] = await Promise.all([readMeta(pr, opts.repoRoot), readTruth(pr, opts.repoRoot)]);
+      return { pr, meta, commentCount: truth.comments.length, skipped: true };
+    } catch {
+      // Missing or v1 cache — (re-)fetch below.
     }
   }
 
-  const [meta, diff, comments] = await Promise.all([
-    fetchMeta(octokit, repo, pr),
-    fetchDiff(octokit, repo, pr),
-    fetchReviewComments(octokit, repo, pr, dev),
+  const [pull, files, reviews] = await Promise.all([
+    fetchPull(octokit, repo, pr),
+    fetchFiles(octokit, repo, pr),
+    fetchDevReviews(octokit, repo, pr, dev),
   ]);
+  const comments = await fetchDevComments(octokit, repo, pr, dev, reviews);
 
-  const reviewFile: ReviewCommentsFile = {
-    schemaVersion: 1,
+  const firstReview = reviews.find((r) => r.commitId);
+  const firstInline = comments.find((c) => c.kind === "inline" && c.originalCommitId);
+  const reviewedSha = firstReview?.commitId ?? firstInline?.originalCommitId ?? pull.head.sha;
+  const reviewedAt = reviews[0]?.submittedAt ?? comments[0]?.createdAt ?? null;
+
+  let diff: string;
+  let diffSource: Meta["diffSource"] = "reviewed";
+  try {
+    diff = await fetchCompareDiff(octokit, repo, pull.base.sha, reviewedSha);
+  } catch {
+    // Reviewed commit no longer reachable (force-push) — best effort.
+    diff = await fetchPrDiff(octokit, repo, pr);
+    diffSource = "final";
+  }
+
+  const meta: Meta = {
+    schemaVersion: 2,
+    number: pull.number,
+    repo,
+    title: pull.title,
+    body: pull.body ?? "",
+    author: pull.user?.login ?? "",
+    state: pull.state,
+    baseSha: pull.base.sha,
+    headSha: pull.head.sha,
+    createdAt: pull.created_at,
+    mergedAt: pull.merged_at,
+    reviewedSha,
+    reviewedAt,
+    devReviewStates: reviews.map((r) => r.state),
+    diffSource,
+    files,
+  };
+
+  const truth: ReviewCommentsFile = {
+    schemaVersion: 2,
     pr,
     repo,
     reviewer: dev,
     comments,
   };
 
-  // Validate against the shared contract before writing, so schema drift fails
-  // here rather than surfacing later inside a pi agent.
+  // Validate against the shared contract before writing so drift fails here.
   await writeJson(paths.meta(pr), MetaSchema.parse(meta));
   await writeText(paths.diff(pr), diff);
-  await writeJson(
-    paths.reviewComments(pr),
-    ReviewCommentsFileSchema.parse(reviewFile),
-  );
+  await writeJson(paths.reviewComments(pr), ReviewCommentsFileSchema.parse(truth));
 
-  return { pr, commentCount: comments.length, skipped: false };
+  return { pr, meta, commentCount: comments.length, skipped: false };
+}
+
+/** Train/test split on the dev's first-review date. */
+export function isTraining(meta: Meta, trainUntil: string | undefined): boolean {
+  if (!trainUntil) return true;
+  return (meta.reviewedAt ?? meta.createdAt) < trainUntil;
 }
