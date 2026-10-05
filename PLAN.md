@@ -34,6 +34,7 @@
 | `setup` | `--dev --repo --repo-path --train-until [--skill-name --rules-path --post-threshold --max-budget]` |
 | `ingest [prs…]` | Discover PRs the dev reviewed (incl. clean approvals); cache meta + diff at reviewed commit + all dev comments |
 | `learn [prs…]` | classify → learn on training PRs + harvested candidates; ledger prevents re-feeding |
+| `compact` | Group candidate duplicates (1 call over the index) → merge (1 call per group) → audit every live rule against the repo's default branch (Haiku, read-only sandbox, parallel, cached per rule+commit) → keep / rescope / retire / contested (≥5 comments never auto-retired) + tooling recommendations. Backs up the rule set first; report in `runs/<ts>/compaction.md` |
 | `evaluate` | Held-out replay: review in sandbox → judge → `runs/<ts>/report.{md,json}` (the comfort report) |
 | `review <pr> [--post]` | Pre-review a live PR at head; dry-run prints, `--post` publishes. CI: `--in-place --rules-ref origin/<base>` |
 | `harvest` | 👍/👎 on watchtower comments → `stats/rules.json`; PRs where the dev commented after the pre-review → candidates |

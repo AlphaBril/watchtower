@@ -28,6 +28,9 @@ export function watchtowerPaths(repoRoot: string = process.cwd()) {
     skillDir: (name: string) => resolve(root, "skill", name),
 
     runDir: (ts: string) => resolve(root, "runs", ts),
+
+    /** Cached repo-audit result per rule (keyed by rule content + commit). */
+    audit: (ruleId: string) => resolve(root, "audit", `${ruleId}.json`),
   };
 }
 

@@ -10,6 +10,7 @@ import { registerHarvest } from "./commands/harvest.js";
 import { registerPublish } from "./commands/publish.js";
 import { registerRules } from "./commands/rules.js";
 import { registerSkill } from "./commands/skill.js";
+import { registerCompact } from "./commands/compact.js";
 
 async function main(): Promise<void> {
   loadDotEnv();
@@ -25,6 +26,7 @@ async function main(): Promise<void> {
   registerSetup(program);
   registerIngest(program);
   registerLearn(program);
+  registerCompact(program);
   registerEvaluate(program);
   registerReview(program);
   registerHarvest(program);

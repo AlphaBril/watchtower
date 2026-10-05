@@ -8,6 +8,10 @@ export const ModelsSchema = z.object({
   learn: z.string().default("claude-opus-5-5"),
   review: z.string().default("claude-sonnet-5"),
   judge: z.string().default("claude-opus-5-5"),
+  /** compact: merges near-duplicate rules. */
+  merge: z.string().default("claude-sonnet-5"),
+  /** compact: checks each rule against the repo — cheap, many calls. */
+  audit: z.string().default("claude-haiku-4-5-20251001"),
 });
 
 export const ConfigSchema = z.object({

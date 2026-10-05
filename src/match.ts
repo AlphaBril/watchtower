@@ -34,7 +34,7 @@ export interface CandidatePair {
   lineDistance: number | null;
 }
 
-function tokenize(body: string): Set<string> {
+export function tokenize(body: string): Set<string> {
   const tokens = new Set<string>();
   // Split camelCase / snake_case identifiers so `companyId` also yields
   // `company` and `id`, then keep meaningful word/identifier tokens.
@@ -49,7 +49,7 @@ function tokenize(body: string): Set<string> {
   return tokens;
 }
 
-function jaccard(a: Set<string>, b: Set<string>): number {
+export function jaccard(a: Set<string>, b: Set<string>): number {
   if (a.size === 0 || b.size === 0) return 0;
   let intersection = 0;
   for (const t of a) if (b.has(t)) intersection++;

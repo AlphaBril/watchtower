@@ -220,6 +220,66 @@ export const ReviewFileSchema = z.object({
 
 export type ReviewFile = z.infer<typeof ReviewFileSchema>;
 
+// ── compact: duplicate-grouping agent output ─────────────────────────────────
+
+export const GroupOutputSchema = z.object({
+  groups: z.array(z.object({ concern: z.string(), ids: z.array(z.string()) })),
+});
+
+export type GroupOutput = z.infer<typeof GroupOutputSchema>;
+
+// ── compact: merge agent output ──────────────────────────────────────────────
+
+export const MergeOutputSchema = z.object({
+  merges: z.array(
+    z.object({
+      /** Rule ids folded into this one (≥2, all from the given cluster). */
+      from: z.array(z.string()),
+      id: z.string(),
+      title: z.string(),
+      kind: RuleKind,
+      severity: Severity,
+      paths: z.array(z.string()),
+      body: z.string(),
+    }),
+  ),
+});
+
+export type MergeOutput = z.infer<typeof MergeOutputSchema>;
+
+// ── compact: repo audit agent output ─────────────────────────────────────────
+
+export const ToolingKind = z.enum(["eslint", "typescript", "custom-lint-rule", "ci-check", "codemod", "other"]);
+
+export const AuditOutputSchema = z.object({
+  /** The code pattern the rule is about actually occurs in its scope. */
+  applies: z.boolean(),
+  checked: z.number().int().nonnegative(),
+  conforming: z.number().int().nonnegative(),
+  violating: z.number().int().nonnegative(),
+  examples: z.array(
+    z.object({ path: z.string(), line: z.number().int().nullable(), conforms: z.boolean(), note: z.string() }),
+  ),
+  /** Already enforced by existing tooling (lint config, compiler, CI, shared helper). */
+  alreadyEnforced: z.boolean(),
+  alreadyEnforcedBy: z.string().nullable(),
+  /** Could tooling enforce it instead of a reviewer? */
+  tooling: z.object({
+    feasible: z.boolean(),
+    kind: ToolingKind.nullable(),
+    summary: z.string().nullable(),
+    /** Concrete change: config snippet, rule code, CI step — ready to adapt. */
+    implementation: z.string().nullable(),
+    effort: z.enum(["low", "medium", "high"]).nullable(),
+  }),
+  /** Narrower/corrected globs when the current `paths` are wrong or too broad; null = keep. */
+  suggestedPaths: z.array(z.string()).nullable(),
+  verdict: z.enum(["keep", "rescope", "drop"]),
+  reason: z.string(),
+});
+
+export type AuditOutput = z.infer<typeof AuditOutputSchema>;
+
 // ── judge agent output ───────────────────────────────────────────────────────
 
 export const JudgeOutputSchema = z.object({
