@@ -263,15 +263,6 @@ export const AuditOutputSchema = z.object({
   /** Already enforced by existing tooling (lint config, compiler, CI, shared helper). */
   alreadyEnforced: z.boolean(),
   alreadyEnforcedBy: z.string().nullable(),
-  /** Could tooling enforce it instead of a reviewer? */
-  tooling: z.object({
-    feasible: z.boolean(),
-    kind: ToolingKind.nullable(),
-    summary: z.string().nullable(),
-    /** Concrete change: config snippet, rule code, CI step — ready to adapt. */
-    implementation: z.string().nullable(),
-    effort: z.enum(["low", "medium", "high"]).nullable(),
-  }),
   /** Narrower/corrected globs when the current `paths` are wrong or too broad; null = keep. */
   suggestedPaths: z.array(z.string()).nullable(),
   verdict: z.enum(["keep", "rescope", "drop"]),
@@ -279,6 +270,31 @@ export const AuditOutputSchema = z.object({
 });
 
 export type AuditOutput = z.infer<typeof AuditOutputSchema>;
+
+// ── compact: tooling-feasibility agent output ────────────────────────────────
+
+export const ToolingOutputSchema = z.object({
+  /** A mechanical, reliable check exists that could replace the reviewer for this rule. */
+  feasible: z.boolean(),
+  kind: ToolingKind.nullable(),
+  /**
+   * The concrete mechanism, used to group recommendations into one change, e.g.
+   * "no-restricted-imports", "no-restricted-syntax", "n/no-process-env",
+   * "virtualbrain-eslint-plugin", "tsconfig:noUncheckedIndexedAccess", "ci-grep".
+   */
+  mechanism: z.string().nullable(),
+  summary: z.string().nullable(),
+  /** Concrete change: config snippet, rule code, CI step — ready to adapt. */
+  implementation: z.string().nullable(),
+  /** Of the audit's violating examples, how many the check would flag. */
+  catchesViolations: z.number().int().nonnegative(),
+  /** Of the audit's conforming examples, how many the check would wrongly flag. */
+  falsePositives: z.number().int().nonnegative(),
+  effort: z.enum(["low", "medium", "high"]).nullable(),
+  reason: z.string(),
+});
+
+export type ToolingOutput = z.infer<typeof ToolingOutputSchema>;
 
 // ── judge agent output ───────────────────────────────────────────────────────
 

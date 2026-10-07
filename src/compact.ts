@@ -11,9 +11,11 @@ import {
   GroupOutputSchema,
   MergeOutputSchema,
   RULE_ID_RE,
+  ToolingOutputSchema,
   type AuditOutput,
   type MergeOutput,
   type Rule,
+  type ToolingOutput,
 } from "./schemas.js";
 
 /**
@@ -23,9 +25,12 @@ import {
  *              duplicates, then one call per group folds the true ones together.
  *  2. audit  — one cheap read-only agent per rule checks it against the repo
  *              at a given commit: does the pattern occur, does the code follow
- *              it, is it already enforced by tooling, could tooling enforce it,
- *              are its paths right?
+ *              it, is it already enforced by tooling, are its paths right?
  *  3. decide — deterministic: keep / rescope / retire / contested.
+ *  4. tooling — a stronger agent, only for surviving rules the code mostly
+ *              follows: could a lint rule / compiler option / CI check
+ *              replace the reviewer? Tested against the audit's examples;
+ *              accepted only with zero false positives.
  *
  * Rules are retired, never deleted. Rules backed by STRONG_EVIDENCE source
  * comments are never retired automatically — they're reported as contested.
@@ -216,7 +221,7 @@ export async function auditRule(rule: Rule, ctx: AuditContext): Promise<{ result
     schema: AuditOutputSchema,
     tools: ["Read", "Grep", "Glob"],
     sandboxRoot: ctx.dir,
-    maxTurns: 20,
+    maxTurns: 40,
     maxBudgetUsd: Math.min(ctx.config.maxBudgetUsd, 1),
     costs: ctx.costs,
   });
@@ -225,6 +230,12 @@ export async function auditRule(rule: Rule, ctx: AuditContext): Promise<{ result
 }
 
 // ── 4. deciding ──────────────────────────────────────────────────────────────
+
+/** Below this conforming share (on at least IGNORED_MIN_SAMPLE instances), a non-invariant rule is retired. */
+const IGNORED_BELOW = 0.25;
+const IGNORED_MIN_SAMPLE = 5;
+
+const conformance = (a: AuditOutput) => (a.checked === 0 ? 0 : a.conforming / a.checked);
 
 export type Action = "keep" | "rescope" | "retire" | "contested";
 
@@ -251,9 +262,88 @@ export function decide(rule: Rule, audit: AuditOutput, files: string[]): Decisio
 
   if (audit.alreadyEnforced) return retireOr(`already enforced by ${audit.alreadyEnforcedBy ?? "tooling"}`);
   if (audit.verdict === "drop") return retireOr(audit.reason);
+  // Conventions/taste the code broadly doesn't follow aren't how this team
+  // writes code. (Invariants are exempt: there, violations are bugs.)
+  if (rule.kind !== "invariant" && audit.checked >= IGNORED_MIN_SAMPLE && conformance(audit) < IGNORED_BELOW) {
+    return retireOr(`the codebase broadly doesn't follow it (${audit.conforming}/${audit.checked} conform) — ${audit.reason}`);
+  }
 
   const valid = (audit.suggestedPaths ?? []).filter((g) => files.some((f) => matchesAny(f, [g])));
   const changed = valid.length > 0 && JSON.stringify([...valid].sort()) !== JSON.stringify([...rule.paths].sort());
   if (changed) return { ruleId: rule.id, action: "rescope", reason: audit.reason, newPaths: valid };
   return { ruleId: rule.id, action: "keep", reason: audit.reason, newPaths: null };
+}
+
+// ── 5. tooling feasibility ───────────────────────────────────────────────────
+
+/** A rule must conform at least this much for a guard to be worth adding (else it's a migration, not a lint rule). */
+const TOOLING_MIN_CONFORMANCE = 0.5;
+const TOOLING_MIN_SAMPLE = 3;
+
+/**
+ * Only surviving rules with a real convention behind them get a tooling pass:
+ * not retired/contested, the pattern occurs, the code mostly follows it, and
+ * it isn't taste (taste is judgment by definition).
+ */
+export function toolingCandidate(rule: Rule, audit: AuditOutput, decision: Decision): boolean {
+  return (
+    (decision.action === "keep" || decision.action === "rescope") &&
+    rule.kind !== "taste" &&
+    audit.applies &&
+    audit.checked >= TOOLING_MIN_SAMPLE &&
+    conformance(audit) >= TOOLING_MIN_CONFORMANCE
+  );
+}
+
+/** The agent's verdict, held to the bar it was given: concrete, and zero false positives on the sampled examples. */
+export function acceptTooling(t: ToolingOutput): boolean {
+  return t.feasible && !!t.implementation?.trim() && !!t.mechanism?.trim() && t.falsePositives === 0;
+}
+
+export async function assessTooling(
+  rule: Rule,
+  audit: AuditOutput,
+  ctx: AuditContext,
+): Promise<{ result: ToolingOutput; cached: boolean }> {
+  const cachePath = watchtowerPaths().tooling(rule.id);
+  const key = auditKey(rule, ctx.sha);
+  try {
+    const cached = JSON.parse(await readFile(cachePath, "utf8")) as { key: string; result: unknown };
+    if (cached.key === key) return { result: ToolingOutputSchema.parse(cached.result), cached: true };
+  } catch {
+    // no cache yet
+  }
+
+  const prompt = [
+    `Could tooling enforce rule \`${rule.id}\` in the repository at ${ctx.sha.slice(0, 12)}?`,
+    "",
+    "```json",
+    JSON.stringify({ id: rule.id, title: rule.title, kind: rule.kind, severity: rule.severity, paths: rule.paths, body: rule.body }, null, 2),
+    "```",
+    "",
+    `Audit: ${audit.conforming}/${audit.checked} conform, ${audit.violating} violate. ${audit.reason}`,
+    "",
+    "Examples (✓ conforms, ✗ violates):",
+    ...(audit.examples.length
+      ? audit.examples.map((e) => `- ${e.conforms ? "✓" : "✗"} \`${e.path}${e.line ? `:${e.line}` : ""}\` ${e.note}`)
+      : ["- (none recorded)"]),
+    "",
+    "Tooling config files present:",
+    ...(ctx.tooling.length ? ctx.tooling.map((f) => `- ${f}`) : ["- (none found)"]),
+  ].join("\n");
+
+  const result = await runAgent({
+    agent: "tooling",
+    model: ctx.config.models.tooling,
+    systemPrompt: await loadPrompt("tooling"),
+    prompt,
+    schema: ToolingOutputSchema,
+    tools: ["Read", "Grep", "Glob"],
+    sandboxRoot: ctx.dir,
+    maxTurns: 25,
+    maxBudgetUsd: Math.min(ctx.config.maxBudgetUsd, 1),
+    costs: ctx.costs,
+  });
+  await writeJson(cachePath, { key, ruleId: rule.id, sha: ctx.sha, at: new Date().toISOString(), result });
+  return { result, cached: false };
 }

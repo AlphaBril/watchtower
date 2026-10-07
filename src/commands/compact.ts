@@ -3,11 +3,14 @@ import { execa } from "execa";
 import { cp } from "node:fs/promises";
 import { CostLog } from "../agent.js";
 import {
+  acceptTooling,
   applyMerges,
+  assessTooling,
   auditRule,
   groupCandidates,
   decide,
   mergeCluster,
+  toolingCandidate,
   toolingFiles,
   type MergeApplied,
 } from "../compact.js";
@@ -108,25 +111,61 @@ export function registerCompact(program: Command): void {
         const results = await mapPool(toAudit, opts.concurrency, async (rule) => {
           const t0 = Date.now();
           const callCosts = new CostLog();
-          const { result, cached } = await auditRule(rule, { dir, sha, files, tooling, config, costs: callCosts });
-          costs.runs.push(...callCosts.runs);
+          let audited: Awaited<ReturnType<typeof auditRule>>;
+          try {
+            audited = await auditRule(rule, { dir, sha, files, tooling, config, costs: callCosts });
+          } catch (err) {
+            // A failed call (e.g. max turns) still cost money — count it, and say so.
+            log(`[${++n}/${toAudit.length}] ${rule.id} → FAILED · ${secs(Date.now() - t0)} · $${callCosts.totalUsd} · ${err instanceof Error ? err.message : String(err)}`);
+            throw err;
+          } finally {
+            costs.runs.push(...callCosts.runs);
+          }
+          const { result, cached } = audited;
           if (cached) cachedCount++;
           const d = decide(rule, result, files);
           log(
             `[${++n}/${toAudit.length}] ${rule.id} → ${d.action}` +
-              ` (${result.conforming}/${result.checked} conform${result.tooling.feasible ? ", tooling ✓" : ""})` +
+              ` (${result.conforming}/${result.checked} conform)` +
               (cached ? " · cached" : ` · ${secs(Date.now() - t0)} · $${callCosts.totalUsd}`),
           );
           if (n % 20 === 0) await writeJson(`${runDir}/costs.json`, { totalUsd: costs.totalUsd, runs: costs.runs });
           return { result, decision: d };
         });
         if (cachedCount) log(`${cachedCount} audit(s) reused from cache`);
-        return toAudit.map((rule, i) => {
+        const audited: CompactionRecord[] = toAudit.map((rule, i) => {
           const r = results[i]!;
           return r.ok
-            ? { rule, audit: r.value.result, decision: r.value.decision, error: null }
-            : { rule, audit: null, decision: null, error: r.error instanceof Error ? r.error.message : String(r.error) };
+            ? { rule, audit: r.value.result, decision: r.value.decision, tooling: null, error: null }
+            : { rule, audit: null, decision: null, tooling: null, error: r.error instanceof Error ? r.error.message : String(r.error) };
         });
+
+        // ── 2b. tooling feasibility, only for rules worth guarding ──
+        const candidates = audited.filter((r) => r.audit && r.decision && toolingCandidate(r.rule, r.audit, r.decision));
+        console.log(`\n── Tooling: ${candidates.length} candidate rule(s) (${config.models.tooling}) ──`);
+        let m = 0;
+        let cachedTooling = 0;
+        await mapPool(candidates, opts.concurrency, async (rec) => {
+          const t0 = Date.now();
+          const callCosts = new CostLog();
+          try {
+            const { result, cached } = await assessTooling(rec.rule, rec.audit!, { dir, sha, files, tooling, config, costs: callCosts });
+            if (cached) cachedTooling++;
+            rec.tooling = result;
+            const verdict = acceptTooling(result)
+              ? `✓ ${result.mechanism} · effort ${result.effort ?? "?"}`
+              : result.feasible
+                ? `✗ rejected (${result.falsePositives} false positive(s))`
+                : "✗ not mechanical";
+            log(`[${++m}/${candidates.length}] ${rec.rule.id} → ${verdict}` + (cached ? " · cached" : ` · ${secs(Date.now() - t0)} · $${callCosts.totalUsd}`));
+          } catch (err) {
+            log(`[${++m}/${candidates.length}] ${rec.rule.id} → FAILED · ${err instanceof Error ? err.message : String(err)}`);
+          } finally {
+            costs.runs.push(...callCosts.runs);
+          }
+        });
+        if (cachedTooling) log(`${cachedTooling} tooling assessment(s) reused from cache`);
+        return audited;
       });
 
       // ── 3. apply decisions ──
@@ -151,7 +190,7 @@ export function registerCompact(program: Command): void {
         startedAt,
         before,
         merges,
-        records: records.map((r) => ({ ruleId: r.rule.id, decision: r.decision, audit: r.audit, error: r.error })),
+        records: records.map((r) => ({ ruleId: r.rule.id, decision: r.decision, audit: r.audit, tooling: r.tooling, error: r.error })),
       });
       await writeJson(`${runDir}/costs.json`, { totalUsd: costs.totalUsd, runs: costs.runs });
 
@@ -161,7 +200,7 @@ export function registerCompact(program: Command): void {
       console.log(`Live rules:   ${before} → ${liveAfter}`);
       console.log(`Merged away:  ${merges.reduce((n, m) => n + m.from.length - 1, 0)} (into ${merges.length})`);
       console.log(`Kept ${count("keep")} · rescoped ${count("rescope")} · retired ${count("retire")} · contested ${count("contested")} · failed ${records.filter((r) => r.error).length}`);
-      console.log(`Tooling recommendations: ${records.filter((r) => r.audit?.tooling.feasible && r.decision?.action !== "retire").length}`);
+      console.log(`Tooling recommendations: ${records.filter((r) => r.tooling && acceptTooling(r.tooling)).length}`);
       console.log(`Spend ≈ $${costs.totalUsd}`);
       console.log(`Report: ${runDir}/compaction.md`);
     });

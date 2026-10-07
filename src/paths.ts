@@ -31,6 +31,9 @@ export function watchtowerPaths(repoRoot: string = process.cwd()) {
 
     /** Cached repo-audit result per rule (keyed by rule content + commit). */
     audit: (ruleId: string) => resolve(root, "audit", `${ruleId}.json`),
+
+    /** Cached tooling-feasibility result per rule (same key as its audit). */
+    tooling: (ruleId: string) => resolve(root, "audit", "tooling", `${ruleId}.json`),
   };
 }
 

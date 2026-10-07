@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { applyMerges, decide, sanitizeGroups, toolingFiles } from "../src/compact.js";
+import { acceptTooling, applyMerges, decide, sanitizeGroups, toolingCandidate, toolingFiles } from "../src/compact.js";
 import { mapPool } from "../src/pool.js";
-import type { AuditOutput, Rule } from "../src/schemas.js";
+import type { AuditOutput, Rule, ToolingOutput } from "../src/schemas.js";
 
 const rule = (id: string, over: Partial<Rule> = {}): Rule => ({
   id,
@@ -24,7 +24,6 @@ const audit = (over: Partial<AuditOutput> = {}): AuditOutput => ({
   examples: [],
   alreadyEnforced: false,
   alreadyEnforcedBy: null,
-  tooling: { feasible: false, kind: null, summary: null, implementation: null, effort: null },
   suggestedPaths: null,
   verdict: "keep",
   reason: "followed",
@@ -90,6 +89,46 @@ test("decide: keep, rescope (only valid globs), retire, contested for strong evi
   const d = decide(strong, audit({ verdict: "drop" }), files);
   assert.equal(d.action, "contested");
   assert.match(d.reason, /5 review comments/);
+});
+
+test("decide: retires conventions the code broadly ignores, never invariants", () => {
+  const ignored = audit({ checked: 10, conforming: 1, violating: 9 });
+  assert.equal(decide(rule("r"), ignored, []).action, "retire");
+  assert.equal(decide(rule("r", { kind: "taste" }), ignored, []).action, "retire");
+  assert.equal(decide(rule("r", { kind: "invariant" }), ignored, []).action, "keep");
+  // too small a sample to call it
+  assert.equal(decide(rule("r"), audit({ checked: 4, conforming: 0, violating: 4 }), []).action, "keep");
+  const strong = rule("r", { sourceComments: ["gh:1", "gh:2", "gh:3", "gh:4", "gh:5"] });
+  assert.equal(decide(strong, ignored, []).action, "contested");
+});
+
+test("toolingCandidate: surviving, mostly-followed, non-taste rules only", () => {
+  const keep = decide(rule("r"), audit(), []);
+  assert.equal(toolingCandidate(rule("r"), audit(), keep), true);
+  assert.equal(toolingCandidate(rule("r", { kind: "taste" }), audit(), keep), false);
+  assert.equal(toolingCandidate(rule("r"), audit({ checked: 8, conforming: 3, violating: 5 }), keep), false);
+  assert.equal(toolingCandidate(rule("r"), audit({ checked: 2, conforming: 2, violating: 0 }), keep), false);
+  assert.equal(toolingCandidate(rule("r"), audit({ applies: false }), keep), false);
+  assert.equal(toolingCandidate(rule("r"), audit(), { ...keep, action: "contested" }), false);
+});
+
+test("acceptTooling: feasible, concrete, and zero false positives", () => {
+  const t: ToolingOutput = {
+    feasible: true,
+    kind: "eslint",
+    mechanism: "no-restricted-imports",
+    summary: "s",
+    implementation: "{ ... }",
+    catchesViolations: 2,
+    falsePositives: 0,
+    effort: "low",
+    reason: "r",
+  };
+  assert.equal(acceptTooling(t), true);
+  assert.equal(acceptTooling({ ...t, falsePositives: 1 }), false);
+  assert.equal(acceptTooling({ ...t, feasible: false }), false);
+  assert.equal(acceptTooling({ ...t, implementation: " " }), false);
+  assert.equal(acceptTooling({ ...t, mechanism: null }), false);
 });
 
 test("toolingFiles picks lint/ts/ci config, not regular sources", () => {

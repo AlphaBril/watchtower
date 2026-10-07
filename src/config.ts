@@ -12,6 +12,8 @@ export const ModelsSchema = z.object({
   merge: z.string().default("claude-sonnet-5"),
   /** compact: checks each rule against the repo — cheap, many calls. */
   audit: z.string().default("claude-haiku-4-5-20251001"),
+  /** compact: judges whether a surviving rule could be enforced by tooling — fewer calls, needs judgment. */
+  tooling: z.string().default("claude-sonnet-5"),
 });
 
 export const ConfigSchema = z.object({
